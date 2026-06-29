@@ -1,19 +1,20 @@
 """
 Interactive contactor toggler for the TE Flex Logger chassis.
 
-Press Enter to toggle all configured contactor DO lines HIGH/LOW.
-Press q + Enter or Ctrl+C to exit and release contactors LOW.
+  1 + Enter  — C1 (LINE0) HIGH, C2 LOW
+  2 + Enter  — C2 (LINE1) HIGH, C1 LOW
+  Enter      — all contactors LOW
+  q + Enter or Ctrl+C — exit and release LOW
 """
 
 import os
 
 SIMULATE = os.environ.get("SIMULATE", "False").lower() in ("1", "true", "yes", "y")
 
-# Update these lines to match the TE Flex Logger chassis contactor outputs.
+# LINE0 = C1, LINE1 = C2 (as seen in FlexLogger)
 CONTACTOR_LINES = [
-    "cDAQ2Mod1/port0/line0",
-    "cDAQ2Mod1/port0/line1",
-    "cDAQ2Mod1/port0/line2",
+    "cDAQ2Mod3/port0/line0",
+    "cDAQ2Mod3/port0/line1",
 ]
 
 
@@ -21,7 +22,7 @@ class ContactorController:
     def __init__(self, lines, simulate):
         self.simulate = simulate
         self.lines = lines
-        self._state = False
+        self._states = [False] * len(lines)
         self._task = None
 
         if self.simulate:
@@ -35,20 +36,23 @@ class ContactorController:
         self._task.do_channels.add_do_chan(
             ",".join(lines),
             line_grouping=LineGrouping.CHAN_PER_LINE)
-        self.set(False)
+        self._write()
 
-    def set(self, high):
-        self._state = high
+    def _write(self):
         if self.simulate:
-            print(f"SIMULATE: setting contactors {'HIGH' if high else 'LOW'}")
+            labels = ["HIGH" if s else "LOW" for s in self._states]
+            print(f"SIMULATE: {', '.join(f'LINE{i}={l}' for i, l in enumerate(labels))}")
             return
+        self._task.write(list(self._states))
 
-        values = [high] * len(self.lines)
-        self._task.write(values)
+    def set_one(self, index):
+        """Set one line HIGH, all others LOW."""
+        self._states = [i == index for i in range(len(self.lines))]
+        self._write()
 
-    @property
-    def is_high(self):
-        return self._state
+    def all_low(self):
+        self._states = [False] * len(self.lines)
+        self._write()
 
     def close(self):
         if self._task is not None:
@@ -59,21 +63,32 @@ def main():
     controller = ContactorController(CONTACTOR_LINES, SIMULATE)
 
     print("Connected to TE Flex Logger chassis.")
-    print("Press Enter to toggle contactor lines HIGH/LOW.")
-    print("Press q + Enter or Ctrl+C to quit.")
+    print("  1 + Enter  -> C1 (LINE0) HIGH, C2 LOW")
+    print("  2 + Enter  -> C2 (LINE1) HIGH, C1 LOW")
+    print("  Enter      -> all LOW")
+    print("  q + Enter or Ctrl+C to quit.")
     print(f"SIMULATE={SIMULATE}\n")
 
     try:
         while True:
-            cmd = input()
-            if cmd.strip().lower() == "q":
+            cmd = input(">> ").strip().lower()
+            if cmd == "q":
                 break
-            controller.set(not controller.is_high)
-            print(f"  >> CONTACTORS {'HIGH' if controller.is_high else 'LOW'}")
+            elif cmd == "1":
+                controller.set_one(0)
+                print("  C1 HIGH, C2 LOW")
+            elif cmd == "2":
+                controller.set_one(1)
+                print("  C2 HIGH, C1 LOW")
+            elif cmd == "":
+                controller.all_low()
+                print("  All LOW")
+            else:
+                print("  Unknown command. Use 1, 2, or Enter.")
     except KeyboardInterrupt:
         print("\nCtrl+C.")
     finally:
-        controller.set(False)
+        controller.all_low()
         controller.close()
         print("Stopped: contactors set LOW.")
 
