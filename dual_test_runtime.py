@@ -1,13 +1,15 @@
 """
 dual_test_runtime.py
 
-Modular runtime for two independent current-flow tests:
-- HV Connectors test (Contactor 2 / HV enable)
-- CCA Fuses test (Contactor 1 / fuse close)
+Runtime for a single alternating current-flow sequence shared between two
+test setups:
+- HV Connectors test (line0 + line1 contactors, staggered close)
+- CCA Fuses test (line2 contactor)
 
-Each test has editable runtime variables, separate Influx buckets, and
-persistent cycle state so the script can pause/resume and recover after
-restart.
+Only one setup ever draws current at a time. The runtime cycles between
+them automatically and indefinitely: flow on the active test, a grace
+period with current off, then contactors flip and the other test flows.
+Persistent state lets the script pause/resume and recover after restart.
 """
 
 import csv
@@ -37,17 +39,25 @@ HISTORY_FILE = 'dual_test_history.log'
 LOG_FILE_XLSX = 'dual_test_log.xlsx'
 LOG_FILE_CSV_TEMPLATE = 'dual_test_log_{test}.csv'
 
-# Set the contactor lines for each test.
+AUTO_START = False
+GRACE_PERIOD_S = 15
+
+# Contactors on the same 12V supply must not close at the same instant
+# (inrush). When a test has multiple contactor_channel entries, they are
+# closed one at a time with this delay between each.
+CONTACTOR_STAGGER_S = 2.0
+
+# Set the contactor line(s) for each test. A single channel string energizes
+# one contactor; a list energizes each in turn, staggered by CONTACTOR_STAGGER_S.
 TEST_DEFINITIONS = {
     'HV': {
         'label': 'HV Connectors',
-        'contactor_channel': 'cDAQ2Mod1/line2',
+        'contactor_channel': ['cDAQ2Mod1/line0', 'cDAQ2Mod1/line1'],
         'enabled': True,
-        'auto_start': False,
         'influx_bucket_env': 'INFLUX_BUCKET_HV',
-        'max_current_a': 2.0,
-        'flow_duration_s': 30.0,
-        'pause_duration_s': 60.0,
+        'influx_token_env': 'INFLUX_TOKEN_HV',
+        'max_current_a': 675,
+        'flow_duration_min': 45,
         'bucket_tag': 'hv',
         'tc_channels': [
             ('cDAQ2Mod3/ai0',  'C01_SANTO'),
@@ -66,7 +76,7 @@ TEST_DEFINITIONS = {
             ('cDAQ2Mod3/ai13', 'C14_COND'),
             ('cDAQ2Mod3/ai14', 'C15_SANTO'),
             ('cDAQ2Mod3/ai15', 'C16_SANTO'),
-            ('cDAQ2Mod4/ai0',  'C17_SANTO'),
+            ('cDAQ2Mod4/ai11',  'C17_SANTO'),
             ('cDAQ2Mod4/ai1',  'C18_COND'),
             ('cDAQ2Mod4/ai2',  'C19_SANTO'),
             ('cDAQ2Mod4/ai3',  'C20_SANTO'),
@@ -76,20 +86,27 @@ TEST_DEFINITIONS = {
             ('cDAQ2Mod4/ai7',  'C24_SANTO'),
             ('cDAQ2Mod4/ai8',  'C25_SANTO'),
             ('cDAQ2Mod4/ai9',  'LUG-C26_SANTO'),
-        ],},
+            ('cDAQ2Mod4/ai10', 'TC27_CONT_AMB'),
+            ('cDAQ2Mod4/ai15', 'TC28_CONT_1'),
+            ('cDAQ2Mod4/ai12', 'TC29_CONT_2'),
+            ('cDAQ2Mod4/ai13', 'TC30_CONT_3'),
+            ('cDAQ2Mod4/ai14', 'TC31_TEST_AMB'),
+        ],
+    },
     'FUSE': {
         'label': 'CCA Fuses',
-        'contactor_channel': 'cDAQ2Mod1/line1',
+        'contactor_channel': 'cDAQ2Mod1/line2',
         'enabled': True,
-        'auto_start': False,
         'influx_bucket_env': 'INFLUX_BUCKET_FUSE',
-        'max_current_a': 1.5,
-        'flow_duration_s': 20.0,
-        'pause_duration_s': 40.0,
+        'influx_token_env': 'INFLUX_TOKEN_FUSE',
+        'max_current_a': 215,
+        'flow_duration_min': 35,
         'bucket_tag': 'fuse',
         'tc_channels': [],
     },
 }
+
+SEQUENCE_ORDER = list(TEST_DEFINITIONS.keys())
 
 SHUNTS = [
     {'channel': 'cDAQ2Mod2/ai0', 'name': 'I_out',  'resistance_ohm': SHUNT_RESISTANCE_OHM},
@@ -98,8 +115,21 @@ SHUNTS = [
 TC_TYPE = 'T'
 TC_INTERVAL = 10
 
+# --- HV thermocouple over-temp safety trip ---------------------------------
+# TCs are sampled every TC_INTERVAL (10s). If any channel is at/above its
+# limit for OVER_TEMP_TRIP_READINGS consecutive samples, the sequence
+# auto-pauses (PSU current to 0, contactors open).
+# NOTE: placeholder values -- confirm against real hardware ratings before
+# running unattended.
+CONTACTOR_MAX_TEMP_C = 135.0          # TC28/29/30 (Contactor 1/2/3)
+CONTACTOR_AMBIENT_MAX_TEMP_C = 75.0  # TC27 (Contactor Ambient)
+SAMPLE_MAX_TEMP_C = 145.0            # everything else (C01-C26, TC31 Test Ambient)
+OVER_TEMP_TRIP_READINGS = 2
+
+CONTACTOR_TC_NAMES = {'TC28_CONT_1', 'TC29_CONT_2', 'TC30_CONT_3'}
+CONTACTOR_AMBIENT_TC_NAMES = {'TC27_CONT_AMB'}
+
 INFLUX_URL_ENV = 'INFLUX_URL'
-INFLUX_TOKEN_ENV = 'INFLUX_TOKEN_A'
 INFLUX_ORG_ENV = 'INFLUX_ORG'
 DEFAULT_INFLUX_ORG = 'tesse'
 
@@ -108,135 +138,89 @@ DEFAULT_INFLUX_ORG = 'tesse'
 # ---------------------------------------------------------------------------
 PHASE_IDLE = 'idle'
 PHASE_FLOW = 'flow'
-PHASE_PAUSE = 'pause'
+PHASE_GRACE = 'grace'
 
-class TestState:
-    def __init__(self, name, config):
-        self.name = name
-        self.label = config['label']
-        self.config = config
-        self.cycle = 0
+
+def _other_test(name):
+    idx = SEQUENCE_ORDER.index(name)
+    return SEQUENCE_ORDER[(idx + 1) % len(SEQUENCE_ORDER)]
+
+
+def _tc_temp_limit(name):
+    if name in CONTACTOR_AMBIENT_TC_NAMES:
+        return CONTACTOR_AMBIENT_MAX_TEMP_C
+    if name in CONTACTOR_TC_NAMES:
+        return CONTACTOR_MAX_TEMP_C
+    return SAMPLE_MAX_TEMP_C
+
+
+class SequenceState:
+    def __init__(self):
         self.phase = PHASE_IDLE
+        self.active_test = None
         self.manual_pause = False
         self.phase_started_at = None
         self.phase_deadline = None
         self.remaining_s = None
-        self.last_saved_at = None
+        self.cycle_counts = {name: 0 for name in TEST_DEFINITIONS}
 
     def to_dict(self):
         return {
-            'name': self.name,
-            'cycle': self.cycle,
             'phase': self.phase,
+            'active_test': self.active_test,
             'manual_pause': self.manual_pause,
             'phase_started_at': self.phase_started_at,
             'phase_deadline': self.phase_deadline,
             'remaining_s': self.remaining_s,
-            'last_saved_at': self.last_saved_at,
+            'cycle_counts': self.cycle_counts,
         }
 
     @classmethod
-    def from_dict(cls, config, data):
-        state = cls(data['name'], config)
-        state.cycle = data.get('cycle', 0)
+    def from_dict(cls, data):
+        state = cls()
         state.phase = data.get('phase', PHASE_IDLE)
+        state.active_test = data.get('active_test')
         state.manual_pause = data.get('manual_pause', False)
         state.phase_started_at = data.get('phase_started_at')
         state.phase_deadline = data.get('phase_deadline')
         state.remaining_s = data.get('remaining_s')
-        state.last_saved_at = data.get('last_saved_at')
+        counts = data.get('cycle_counts', {})
+        state.cycle_counts.update({k: v for k, v in counts.items() if k in TEST_DEFINITIONS})
         return state
 
-    def is_active(self):
-        return self.phase == PHASE_FLOW and not self.manual_pause
-
-    def is_waiting_for_power(self):
-        return self.phase == PHASE_FLOW and not self.manual_pause and self.phase_deadline is not None
-
-    def is_paused(self):
-        return self.manual_pause
-
-    def is_flowing(self):
-        return self.phase == PHASE_FLOW
-
-    def is_in_pause(self):
-        return self.phase == PHASE_PAUSE
-
-    def duration_for_phase(self):
-        if self.phase == PHASE_FLOW:
-            return self.config['flow_duration_s']
-        if self.phase == PHASE_PAUSE:
-            return self.config['pause_duration_s']
-        return 0.0
-
-    def readable_status(self, active_owner_name=None):
-        if self.phase == PHASE_IDLE:
-            return 'idle'
-        if self.is_paused():
-            return f'paused ({self.phase})'
-        if self.phase == PHASE_FLOW:
-            if active_owner_name == self.name:
-                return 'flowing'
-            return 'waiting for power'
-        return self.phase
-
-    def current_bucket_tag(self):
-        return self.config['bucket_tag']
-
-    def to_status_line(self, active_owner_name=None):
-        remaining = self.phase_deadline - time.time() if self.phase_deadline else self.remaining_s
-        remaining_text = f'{remaining:.1f}s' if remaining is not None else 'n/a'
-        active_text = 'owner' if active_owner_name == self.name else ''
-        return (f'{self.label:<12} | cycle {self.cycle:3d} | phase {self.phase:<5} | '
-                f'{"paused" if self.manual_pause else "running" :<7} | remain {remaining_text:<7} {active_text}')
+    def remaining_text(self):
+        if self.phase_deadline is not None:
+            remaining = max(0.0, self.phase_deadline - time.time())
+        elif self.remaining_s is not None:
+            remaining = self.remaining_s
+        else:
+            return 'n/a'
+        return f'{remaining:.1f}s'
 
 
 class StateManager:
     def __init__(self, state_file):
         self.state_file = state_file
         self.lock = threading.RLock()
-        self.states = {}
+        self.state = SequenceState()
 
-    def load(self, configs):
+    def load(self):
         if os.path.isfile(self.state_file):
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
                     raw = json.load(f)
-                tests = raw.get('tests', {})
-                for name, cfg in configs.items():
-                    if name in tests:
-                        self.states[name] = TestState.from_dict(cfg, tests[name])
-                    else:
-                        self.states[name] = TestState(name, cfg)
+                self.state = SequenceState.from_dict(raw.get('sequence', {}))
             except Exception:
                 print('Warning: failed to load state file, starting fresh.')
-                self.states = {name: TestState(name, cfg) for name, cfg in configs.items()}
+                self.state = SequenceState()
         else:
-            self.states = {name: TestState(name, cfg) for name, cfg in configs.items()}
-
-        now = time.time()
-        for state in self.states.values():
-            if state.phase_deadline is not None and not state.manual_pause:
-                remaining = state.phase_deadline - now
-                if remaining <= 0:
-                    state.phase_deadline = now
-                else:
-                    state.remaining_s = None
-            if state.manual_pause and state.remaining_s is None:
-                state.remaining_s = state.duration_for_phase()
+            self.state = SequenceState()
 
     def save(self):
         with self.lock:
-            output = {'tests': {name: state.to_dict() for name, state in self.states.items()},
-                      'saved_at': time.time()}
+            output = {'sequence': self.state.to_dict(), 'saved_at': time.time()}
             with open(self.state_file, 'w', encoding='utf-8') as f:
                 json.dump(output, f, indent=2)
-
-    def get(self, name):
-        return self.states[name]
-
-    def all_states(self):
-        return list(self.states.values())
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +340,31 @@ class Contactor:
             self._write(False)
             self._task.close()
             self._task = None
+
+
+class ContactorGroup:
+    """Drives one or more Contactor instances as a unit. When more than one
+    contactor is present, energize() closes them one at a time with
+    stagger_s between each so contactors sharing a supply don't inrush
+    simultaneously. de_energize() opens them all immediately."""
+
+    def __init__(self, contactors, stagger_s=0.0):
+        self.contactors = contactors
+        self.stagger_s = stagger_s
+
+    def energize(self):
+        for i, contactor in enumerate(self.contactors):
+            if i > 0 and self.stagger_s > 0:
+                time.sleep(self.stagger_s)
+            contactor.energize()
+
+    def de_energize(self):
+        for contactor in self.contactors:
+            contactor.de_energize()
+
+    def close(self):
+        for contactor in self.contactors:
+            contactor.close()
 
 
 class ShuntReader:
@@ -627,28 +636,32 @@ class DualTestRuntime:
     def __init__(self):
         self._stop_event = threading.Event()
         self._state_manager = StateManager(STATE_FILE)
-        self._state_manager.load(TEST_DEFINITIONS)
+        self._state_manager.load()
+        self._seq = self._state_manager.state
         self._writers = {}
         self._tc_readers = {}
         self._tc_writers = {}
         self._contactors = {}
+        self._tc_over_counts = {}
         self._psu = PSU(PSU_VISA_ADDRESS, PSU_VOLTAGE_LIMIT, SIMULATE)
         self._reader = ShuntReader(SHUNTS, MAX_VOLTAGE_V, SIMULATE)
         self._last_state_save = time.time()
         self._last_tc_log = time.time()
-        self._current_owner = None
         self._load_influx_writers()
         self._create_contactors()
+        self._reconcile_electrical_state()
         self._start_if_needed()
 
     def _load_influx_writers(self):
         url = os.environ[INFLUX_URL_ENV]
-        token = os.environ[INFLUX_TOKEN_ENV]
         org = os.environ.get(INFLUX_ORG_ENV, DEFAULT_INFLUX_ORG)
         for name, cfg in TEST_DEFINITIONS.items():
             bucket = os.environ.get(cfg['influx_bucket_env'])
             if not bucket:
                 raise RuntimeError(f'Missing env var {cfg["influx_bucket_env"]} for {name}')
+            token = os.environ.get(cfg['influx_token_env'])
+            if not token:
+                raise RuntimeError(f'Missing env var {cfg["influx_token_env"]} for {name}')
             if SIMULATE:
                 self._writers[name] = NullWriter(cfg['bucket_tag'])
             else:
@@ -664,190 +677,201 @@ class DualTestRuntime:
 
     def _create_contactors(self):
         for name, cfg in TEST_DEFINITIONS.items():
-            self._contactors[name] = Contactor(cfg['contactor_channel'], SIMULATE, cfg['label'])
+            channels = cfg['contactor_channel']
+            if isinstance(channels, (list, tuple)):
+                contactors = [
+                    Contactor(channel, SIMULATE, f"{cfg['label']} #{i + 1}")
+                    for i, channel in enumerate(channels)
+                ]
+            else:
+                contactors = [Contactor(channels, SIMULATE, cfg['label'])]
+            self._contactors[name] = ContactorGroup(contactors, stagger_s=CONTACTOR_STAGGER_S)
+
+    def _reconcile_electrical_state(self):
+        seq = self._seq
+        if seq.phase == PHASE_IDLE or seq.manual_pause or seq.active_test is None:
+            return
+        cfg = TEST_DEFINITIONS[seq.active_test]
+        if seq.phase == PHASE_FLOW:
+            self._contactors[seq.active_test].energize()
+            self._psu.output_on()
+            self._psu.set_current(cfg['max_current_a'])
+        elif seq.phase == PHASE_GRACE:
+            self._contactors[seq.active_test].energize()
+            self._psu.shutdown('resumed after restart, still in grace period')
 
     def _start_if_needed(self):
-        now = time.time()
-        for state in self._state_manager.all_states():
-            cfg = state.config
-            if state.phase == PHASE_IDLE and cfg.get('auto_start', False):
-                self._transition_to_flow(state, now)
+        if self._seq.phase == PHASE_IDLE and AUTO_START:
+            self.start_sequence()
 
-    def _transition_to_flow(self, state, now):
-        if state.phase != PHASE_FLOW:
-            state.phase = PHASE_FLOW
-            state.cycle += 1
-            state.phase_started_at = now
-            state.remaining_s = state.config['flow_duration_s']
-            state.phase_deadline = now + state.remaining_s
-            state.manual_pause = False
-            self._append_history(state, 'flow_start')
-            self._state_manager.save()
+    def _enter_flow(self, name, now):
+        cfg = TEST_DEFINITIONS[name]
+        previous = self._seq.active_test
+        if previous is not None and previous != name:
+            self._contactors[previous].de_energize()
+        self._contactors[name].energize()
+        self._psu.output_on()
+        self._psu.set_current(cfg['max_current_a'])
+        self._seq.phase = PHASE_FLOW
+        self._seq.active_test = name
+        self._seq.cycle_counts[name] += 1
+        self._seq.phase_started_at = now
+        self._seq.remaining_s = cfg['flow_duration_min'] * 60
+        self._seq.phase_deadline = now + self._seq.remaining_s
+        self._seq.manual_pause = False
+        self._append_history('flow_start', name)
+        self._state_manager.save()
+        print(f'{cfg["label"]} flowing at {cfg["max_current_a"]} A (cycle {self._seq.cycle_counts[name]})')
 
-    def _transition_to_pause(self, state, now):
-        state.phase = PHASE_PAUSE
-        state.phase_started_at = now
-        state.remaining_s = state.config['pause_duration_s']
-        state.phase_deadline = now + state.remaining_s
-        state.manual_pause = False
-        self._append_history(state, 'pause_start')
+    def _enter_grace(self, now):
+        finishing = self._seq.active_test
+        upcoming = _other_test(finishing)
+        self._psu.shutdown(f'grace period before {TEST_DEFINITIONS[upcoming]["label"]}')
+        self._seq.phase = PHASE_GRACE
+        self._seq.phase_started_at = now
+        self._seq.remaining_s = GRACE_PERIOD_S
+        self._seq.phase_deadline = now + GRACE_PERIOD_S
+        self._seq.manual_pause = False
+        self._append_history('grace_start', finishing)
         self._state_manager.save()
 
-    def _transition_to_idle(self, state, now):
-        state.phase = PHASE_IDLE
-        state.phase_started_at = now
-        state.phase_deadline = None
-        state.remaining_s = None
-        state.manual_pause = False
-        self._append_history(state, 'idle')
+    def _enter_idle(self, now):
+        self._psu.shutdown('sequence stopped')
+        if self._seq.active_test is not None:
+            self._contactors[self._seq.active_test].de_energize()
+        self._seq.phase = PHASE_IDLE
+        self._seq.active_test = None
+        self._seq.phase_started_at = now
+        self._seq.phase_deadline = None
+        self._seq.remaining_s = None
+        self._seq.manual_pause = False
+        self._append_history('idle', None)
         self._state_manager.save()
 
-    def _append_history(self, state, event):
+    def _append_history(self, event, test_name):
         entry = {
             'timestamp': time.time(),
-            'test': state.name,
+            'test': test_name,
             'event': event,
-            'cycle': state.cycle,
-            'phase': state.phase,
-            'manual_pause': state.manual_pause,
+            'phase': self._seq.phase,
+            'cycle': self._seq.cycle_counts.get(test_name) if test_name else None,
+            'manual_pause': self._seq.manual_pause,
         }
         with open(HISTORY_FILE, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry) + '\n')
 
-    def _choose_power_owner(self):
-        candidates = [s for s in self._state_manager.all_states()
-                      if s.phase == PHASE_FLOW and not s.manual_pause]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda s: s.phase_started_at or float('inf'))
-
-    def _apply_scheduler(self, now):
-        owner = self._choose_power_owner()
-        self._current_owner = owner.name if owner else None
-
-        for state in self._state_manager.all_states():
-            contactor = self._contactors[state.name]
-            if owner is state:
-                contactor.energize()
-            else:
-                contactor.de_energize()
-
-        if owner is None:
-            self._psu.shutdown('no active test')
+    def _update_sequence(self, now):
+        seq = self._seq
+        if seq.phase == PHASE_IDLE or seq.manual_pause or seq.phase_deadline is None:
             return
-
-        self._psu.output_on()
-        self._psu.set_current(owner.config['max_current_a'])
-
-    def _update_phase_for_state(self, state, now):
-        if state.phase == PHASE_IDLE:
+        if now < seq.phase_deadline:
             return
-        if state.manual_pause:
-            if state.phase_deadline is not None:
-                state.remaining_s = max(0.0, state.phase_deadline - now)
-                state.phase_deadline = None
-            return
-        if state.phase_deadline is None and state.remaining_s is not None:
-            state.phase_deadline = now + state.remaining_s
-        if state.phase_deadline is None:
-            return
-        if state.phase == PHASE_FLOW and self._current_owner != state.name:
-            return
-        remaining = state.phase_deadline - now
-        if remaining > 0:
-            return
-        if state.phase == PHASE_FLOW:
-            self._transition_to_pause(state, now)
-        elif state.phase == PHASE_PAUSE:
-            self._transition_to_flow(state, now)
+        if seq.phase == PHASE_FLOW:
+            self._enter_grace(now)
+        elif seq.phase == PHASE_GRACE:
+            self._enter_flow(_other_test(seq.active_test), now)
 
     def _update_states(self):
         now = time.time()
-        for state in self._state_manager.all_states():
-            if state.phase != PHASE_IDLE and state.phase_deadline is not None:
-                if state.phase_deadline < now:
-                    state.phase_deadline = now
-        self._apply_scheduler(now)
-        for state in self._state_manager.all_states():
-            self._update_phase_for_state(state, now)
+        self._update_sequence(now)
         if time.time() - self._last_state_save > STATE_SAVE_INTERVAL_S:
             self._state_manager.save()
             self._last_state_save = time.time()
 
-    def _ensure_owner_power(self):
-        owner = self._choose_power_owner()
-        if owner is None:
-            return
-        if self._current_owner != owner.name:
-            self._apply_scheduler(time.time())
-
     def _maybe_log_tcs(self, timestamp):
-        hv_state = self._state_manager.get('HV')
-        if hv_state.phase == PHASE_IDLE:
-            return
         if 'HV' not in self._tc_readers or 'HV' not in self._tc_writers:
             return
         try:
             temperatures = self._tc_readers['HV'].read()
             names = self._tc_readers['HV'].names()
             self._tc_writers['HV'].write_tcs(temperatures, names, timestamp)
+            self._check_tc_safety(names, temperatures)
         except Exception as exc:
             print(f'  [tc logger error] {type(exc).__name__}: {exc}')
 
+    def _check_tc_safety(self, names, temperatures):
+        tripped = []
+        for name, temp in zip(names, temperatures):
+            limit = _tc_temp_limit(name)
+            if temp >= limit:
+                count = self._tc_over_counts.get(name, 0) + 1
+                self._tc_over_counts[name] = count
+                if count >= OVER_TEMP_TRIP_READINGS:
+                    tripped.append((name, temp, limit))
+            else:
+                self._tc_over_counts[name] = 0
+
+        if not tripped:
+            return
+        details = ', '.join(f'{name}={temp:.1f}C (limit {limit:.1f}C)' for name, temp, limit in tripped)
+        if self._seq.phase == PHASE_IDLE or self._seq.manual_pause:
+            return
+        print(f'\n!! OVER-TEMP TRIP: {details} — auto-pausing sequence !!')
+        self._append_history('overtemp_trip', self._seq.active_test)
+        self.pause_sequence()
+
     def _write_status(self):
-        owner = self._current_owner
+        seq = self._seq
+        label = TEST_DEFINITIONS[seq.active_test]['label'] if seq.active_test else 'none'
+        state_text = 'paused' if seq.manual_pause else 'running'
+        counts = ', '.join(f'{name}={seq.cycle_counts[name]}' for name in TEST_DEFINITIONS)
         print('\nCurrent runtime status:')
-        for state in self._state_manager.all_states():
-            print('  ' + state.to_status_line(owner))
-        print('  PSU owner:', owner or 'none')
+        print(f'  phase {seq.phase:<5} | active {label:<14} | {state_text:<7} | remain {seq.remaining_text()}')
+        print(f'  cycle counts: {counts}')
 
-    def start_test(self, name):
-        state = self._state_manager.get(name)
-        if state.phase == PHASE_IDLE:
-            self._transition_to_flow(state, time.time())
-            print(f'Started {state.label} cycle {state.cycle}')
+    def start_sequence(self, first_test=None):
+        seq = self._seq
+        if seq.phase != PHASE_IDLE:
+            print('Sequence is already running (use pause/resume/stop).')
             return
-        if state.phase == PHASE_PAUSE:
-            self._transition_to_flow(state, time.time())
-            print(f'Restarted {state.label} at cycle {state.cycle}')
+        name = (first_test or SEQUENCE_ORDER[0]).upper()
+        if name not in TEST_DEFINITIONS:
+            print(f'Unknown test {name}. Choose one of: {", ".join(TEST_DEFINITIONS)}')
             return
-        print(f'{state.label} is already {state.phase}')
+        self._enter_flow(name, time.time())
+        print(f'Started sequence, beginning with {TEST_DEFINITIONS[name]["label"]}')
 
-    def pause_test(self, name):
-        state = self._state_manager.get(name)
-        if state.phase == PHASE_IDLE:
-            print(f'{state.label} is already idle')
+    def pause_sequence(self):
+        seq = self._seq
+        if seq.phase == PHASE_IDLE:
+            print('Sequence is idle.')
             return
-        if state.manual_pause:
-            print(f'{state.label} is already paused')
+        if seq.manual_pause:
+            print('Sequence is already paused.')
             return
-        state.manual_pause = True
-        if state.phase_deadline is not None:
-            state.remaining_s = max(0.0, state.phase_deadline - time.time())
-            state.phase_deadline = None
+        seq.manual_pause = True
+        if seq.phase_deadline is not None:
+            seq.remaining_s = max(0.0, seq.phase_deadline - time.time())
+            seq.phase_deadline = None
+        if seq.phase == PHASE_FLOW:
+            self._psu.shutdown('manual pause')
+            self._contactors[seq.active_test].de_energize()
         self._state_manager.save()
-        print(f'Paused {state.label} at cycle {state.cycle}')
+        print('Sequence paused.')
 
-    def resume_test(self, name):
-        state = self._state_manager.get(name)
-        if not state.manual_pause:
-            print(f'{state.label} is not paused')
+    def resume_sequence(self):
+        seq = self._seq
+        if not seq.manual_pause:
+            print('Sequence is not paused.')
             return
-        state.manual_pause = False
-        if state.remaining_s is None:
-            state.remaining_s = state.duration_for_phase()
-        state.phase_deadline = time.time() + state.remaining_s
+        seq.manual_pause = False
+        if seq.remaining_s is None:
+            seq.remaining_s = 0.0
+        seq.phase_deadline = time.time() + seq.remaining_s
+        if seq.phase == PHASE_FLOW:
+            cfg = TEST_DEFINITIONS[seq.active_test]
+            self._contactors[seq.active_test].energize()
+            self._psu.output_on()
+            self._psu.set_current(cfg['max_current_a'])
         self._state_manager.save()
-        print(f'Resumed {state.label} at cycle {state.cycle}')
+        print('Sequence resumed.')
 
-    def stop_test(self, name):
-        state = self._state_manager.get(name)
-        if state.phase == PHASE_IDLE:
-            print(f'{state.label} is already idle')
+    def stop_sequence(self):
+        if self._seq.phase == PHASE_IDLE:
+            print('Sequence is already idle.')
             return
-        self._transition_to_idle(state, time.time())
-        self._state_manager.save()
-        print(f'Stopped {state.label}')
+        self._enter_idle(time.time())
+        print('Sequence stopped.')
 
     def dump_state(self):
         self._state_manager.save()
@@ -870,32 +894,35 @@ class DualTestRuntime:
 
     def logging_loop(self):
         while not self._stop_event.is_set():
-            active_owner = self._current_owner
+            phase, active_test = self._seq.phase, self._seq.active_test
+            current_owner = active_test if phase == PHASE_FLOW else None
             timestamp = time.time()
-            if active_owner:
-                try:
-                    currents = self._reader.read_currents()
-                    psu_current, psu_voltage = self._psu.measure()
-                    state = self._state_manager.get(active_owner)
-                    self._writers[active_owner].write_currents(currents, SHUNTS, timestamp)
-                    self._writers[f'{active_owner}_csv'].write_currents(
+            try:
+                currents = self._reader.read_currents()
+                psu_current, psu_voltage = self._psu.measure()
+                for name in TEST_DEFINITIONS:
+                    is_active = name == active_test
+                    row_phase = phase if is_active else PHASE_IDLE
+                    cycle = self._seq.cycle_counts[name]
+                    self._writers[name].write_currents(currents, SHUNTS, timestamp)
+                    self._writers[f'{name}_csv'].write_currents(
                         currents, SHUNTS, timestamp,
-                        cycle=state.cycle,
-                        phase=state.phase,
-                        current_owner=active_owner,
+                        cycle=cycle,
+                        phase=row_phase,
+                        current_owner=current_owner,
                         psu_current=psu_current,
                         psu_voltage=psu_voltage,
                     )
-                    self._writers[f'{active_owner}_xlsx'].write_currents(
+                    self._writers[f'{name}_xlsx'].write_currents(
                         currents, SHUNTS, timestamp,
-                        cycle=state.cycle,
-                        phase=state.phase,
-                        current_owner=active_owner,
+                        cycle=cycle,
+                        phase=row_phase,
+                        current_owner=current_owner,
                         psu_current=psu_current,
                         psu_voltage=psu_voltage,
                     )
-                except Exception as exc:
-                    print(f'  [logger error] {type(exc).__name__}: {exc}')
+            except Exception as exc:
+                print(f'  [logger error] {type(exc).__name__}: {exc}')
             if (timestamp - self._last_tc_log) >= TC_INTERVAL:
                 self._maybe_log_tcs(timestamp)
                 self._last_tc_log = timestamp
@@ -925,14 +952,14 @@ class DualTestRuntime:
             self.print_help()
         elif cmd == 'status':
             self._write_status()
-        elif cmd == 'start' and args:
-            self.start_test(args[0].upper())
-        elif cmd == 'pause' and args:
-            self.pause_test(args[0].upper())
-        elif cmd == 'resume' and args:
-            self.resume_test(args[0].upper())
-        elif cmd == 'stop' and args:
-            self.stop_test(args[0].upper())
+        elif cmd == 'start':
+            self.start_sequence(args[0] if args else None)
+        elif cmd == 'pause':
+            self.pause_sequence()
+        elif cmd == 'resume':
+            self.resume_sequence()
+        elif cmd == 'stop':
+            self.stop_sequence()
         elif cmd == 'dump':
             self.dump_state()
         elif cmd in ('quit', 'exit', 'q'):
@@ -944,10 +971,10 @@ class DualTestRuntime:
     def print_help(self):
         print('\nCommands:')
         print('  status               - show current runtime state')
-        print('  start <HV|FUSE>      - begin or resume a test cycle')
-        print('  pause <HV|FUSE>      - pause a running test')
-        print('  resume <HV|FUSE>     - resume a paused test')
-        print('  stop <HV|FUSE>       - stop a test and reset to idle')
+        print('  start [HV|FUSE]      - begin the alternating sequence (defaults to HV first)')
+        print('  pause                - pause the sequence, current off')
+        print('  resume               - resume a paused sequence')
+        print('  stop                 - stop the sequence and reset to idle')
         print('  dump                 - save current state to disk')
         print('  quit / exit / q      - cleanly shutdown and exit')
 
