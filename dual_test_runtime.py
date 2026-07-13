@@ -10,6 +10,13 @@ Only one setup ever draws current at a time. The runtime cycles between
 them automatically and indefinitely: flow on the active test, a grace
 period with current off, then contactors flip and the other test flows.
 Persistent state lets the script pause/resume and recover after restart.
+
+Continuous shunt-current logging to Influx/CSV/XLSX lives in the separate
+logger.py process (run it alongside this script) so logging keeps running
+across restarts of this file. This script still owns the TC thermocouple
+reads and the over-temp safety trip, since those gate its own pause logic,
+and it publishes its PSU current/voltage readback to LIVE_READINGS_FILE for
+logger.py to pick up.
 """
 
 import csv
@@ -38,6 +45,9 @@ STATE_FILE = 'dual_test_state.json'
 HISTORY_FILE = 'dual_test_history.log'
 LOG_FILE_XLSX = 'dual_test_log.xlsx'
 LOG_FILE_CSV_TEMPLATE = 'dual_test_log_{test}.csv'
+# PSU current/voltage readback, refreshed every LOG_INTERVAL, so logger.py can
+# include it in its rows without opening its own connection to the PSU.
+LIVE_READINGS_FILE = 'dual_test_live_readings.json'
 
 AUTO_START = False
 GRACE_PERIOD_S = 15
@@ -56,42 +66,41 @@ TEST_DEFINITIONS = {
         'enabled': True,
         'influx_bucket_env': 'INFLUX_BUCKET_HV',
         'influx_token_env': 'INFLUX_TOKEN_HV',
-        'max_current_a': 675,
-        'flow_duration_min': 45,
+        'max_current_a': 700,
+        'flow_duration_min': 40,
         'bucket_tag': 'hv',
         'tc_channels': [
-            ('cDAQ2Mod3/ai0',  'C01_SANTO'),
-            ('cDAQ2Mod3/ai1',  'C02_COND'),
-            ('cDAQ2Mod3/ai2',  'C03_SANTO'),
-            ('cDAQ2Mod3/ai3',  'C04_COND'),
-            ('cDAQ2Mod3/ai4',  'C05_SANTO'),
-            ('cDAQ2Mod3/ai5',  'C06_COND'),
-            ('cDAQ2Mod3/ai6',  'C07_SANTO'),
-            ('cDAQ2Mod3/ai7',  'C08_SANTO'),
-            ('cDAQ2Mod3/ai8',  'C09_SANTO'),
-            ('cDAQ2Mod3/ai9',  'C10_COND'),
-            ('cDAQ2Mod3/ai10', 'C11_SANTO'),
-            ('cDAQ2Mod3/ai11', 'C12_COND'),
-            ('cDAQ2Mod3/ai12', 'C13_SANTO'),
-            ('cDAQ2Mod3/ai13', 'C14_COND'),
-            ('cDAQ2Mod3/ai14', 'C15_SANTO'),
-            ('cDAQ2Mod3/ai15', 'C16_SANTO'),
-            ('cDAQ2Mod4/ai11',  'C17_SANTO'),
-            ('cDAQ2Mod4/ai1',  'C18_COND'),
-            ('cDAQ2Mod4/ai2',  'C19_SANTO'),
-            ('cDAQ2Mod4/ai3',  'C20_SANTO'),
-            ('cDAQ2Mod4/ai4',  'C21_SANTO'),
-            ('cDAQ2Mod4/ai5',  'C22_SANTO'),
-            ('cDAQ2Mod4/ai6',  'C23_COND'),
-            ('cDAQ2Mod4/ai7',  'C24_SANTO'),
-            ('cDAQ2Mod4/ai8',  'C25_SANTO'),
-            ('cDAQ2Mod4/ai9',  'LUG-C26_SANTO'),
-            ('cDAQ2Mod4/ai10', 'TC27_CONT_AMB'),
-            ('cDAQ2Mod4/ai15', 'TC28_CONT_1'),
-            ('cDAQ2Mod4/ai12', 'TC29_CONT_2'),
-            ('cDAQ2Mod4/ai13', 'TC30_CONT_3'),
-            ('cDAQ2Mod4/ai14', 'TC31_TEST_AMB'),
-        ],
+    ('cDAQ2Mod3/ai0',  'C01_SANTO'),
+    ('cDAQ2Mod3/ai1',  'C02_COND'),
+    ('cDAQ2Mod3/ai2',  'C03_SANTO'),
+    ('cDAQ2Mod3/ai3',  'C04_COND'),
+    ('cDAQ2Mod3/ai4',  'C05_SANTO'),
+    ('cDAQ2Mod3/ai5',  'C06_COND'),
+    ('cDAQ2Mod3/ai6',  'C07_SANTO'),
+    ('cDAQ2Mod3/ai7',  'C08_COND'),
+    ('cDAQ2Mod3/ai8',  'C09_SANTO'),
+    ('cDAQ2Mod3/ai9',  'C10_COND'),
+    ('cDAQ2Mod3/ai10', 'C11_SANTO'),
+    ('cDAQ2Mod3/ai11', 'C12_COND'),
+    ('cDAQ2Mod3/ai12', 'C13_SANTO'),
+    ('cDAQ2Mod3/ai13', 'C14_COND'),
+    ('cDAQ2Mod3/ai14', 'C15_SANTO'),
+    ('cDAQ2Mod3/ai15', 'C16_COND'),
+    ('cDAQ2Mod4/ai1',  'C18_COND'),
+    ('cDAQ2Mod4/ai2',  'C19_SANTO'),
+    ('cDAQ2Mod4/ai3',  'C20_SANTO'),
+    ('cDAQ2Mod4/ai4',  'C21_SANTO'),
+    ('cDAQ2Mod4/ai5',  'C22_SANTO'),
+    ('cDAQ2Mod4/ai6',  'C23_COND'),
+    ('cDAQ2Mod4/ai7',  'C24_SANTO'),
+    ('cDAQ2Mod4/ai8',  'C25_SANTO'),
+    ('cDAQ2Mod4/ai9',  'LUG-C26'),
+    ('cDAQ2Mod4/ai10', 'TC27_CONTACTOR_AMB'),
+    ('cDAQ2Mod4/ai11', 'C17_SANTO'),
+    ('cDAQ2Mod4/ai12', 'TC29_CONTACTOR_2'),
+    ('cDAQ2Mod4/ai13', 'TC30_CONTACTOR_3'),
+    ('cDAQ2Mod4/ai15', 'TC31_TEST_AMB'),
+    ('cDAQ2Mod4/ai14', 'TC28_CONTACTOR_1'),],
     },
     'FUSE': {
         'label': 'CCA Fuses',
@@ -123,7 +132,7 @@ TC_INTERVAL = 10
 # running unattended.
 CONTACTOR_MAX_TEMP_C = 135.0          # TC28/29/30 (Contactor 1/2/3)
 CONTACTOR_AMBIENT_MAX_TEMP_C = 75.0  # TC27 (Contactor Ambient)
-SAMPLE_MAX_TEMP_C = 145.0            # everything else (C01-C26, TC31 Test Ambient)
+SAMPLE_MAX_TEMP_C = 155.0            # everything else (C01-C26, TC31 Test Ambient)
 OVER_TEMP_TRIP_READINGS = 2
 
 CONTACTOR_TC_NAMES = {'TC28_CONT_1', 'TC29_CONT_2', 'TC30_CONT_3'}
@@ -195,7 +204,7 @@ class SequenceState:
             remaining = self.remaining_s
         else:
             return 'n/a'
-        return f'{remaining:.1f}s'
+        return f'{remaining:.1f}s ({remaining / 60.0:.1f} min)'
 
 
 class StateManager:
@@ -638,21 +647,19 @@ class DualTestRuntime:
         self._state_manager = StateManager(STATE_FILE)
         self._state_manager.load()
         self._seq = self._state_manager.state
-        self._writers = {}
         self._tc_readers = {}
         self._tc_writers = {}
         self._contactors = {}
         self._tc_over_counts = {}
         self._psu = PSU(PSU_VISA_ADDRESS, PSU_VOLTAGE_LIMIT, SIMULATE)
-        self._reader = ShuntReader(SHUNTS, MAX_VOLTAGE_V, SIMULATE)
         self._last_state_save = time.time()
         self._last_tc_log = time.time()
-        self._load_influx_writers()
+        self._load_tc_writers()
         self._create_contactors()
         self._reconcile_electrical_state()
         self._start_if_needed()
 
-    def _load_influx_writers(self):
+    def _load_tc_writers(self):
         url = os.environ[INFLUX_URL_ENV]
         org = os.environ.get(INFLUX_ORG_ENV, DEFAULT_INFLUX_ORG)
         for name, cfg in TEST_DEFINITIONS.items():
@@ -662,12 +669,6 @@ class DualTestRuntime:
             token = os.environ.get(cfg['influx_token_env'])
             if not token:
                 raise RuntimeError(f'Missing env var {cfg["influx_token_env"]} for {name}')
-            if SIMULATE:
-                self._writers[name] = NullWriter(cfg['bucket_tag'])
-            else:
-                self._writers[name] = InfluxWriter(url, org, bucket, token, cfg['bucket_tag'])
-            self._writers[f'{name}_csv'] = CsvLogger(name, cfg['label'])
-            self._writers[f'{name}_xlsx'] = ExcelLogger(name, cfg['label'])
             if cfg.get('tc_channels'):
                 if SIMULATE:
                     self._tc_writers[name] = NullTCWriter(cfg['bucket_tag'])
@@ -873,6 +874,24 @@ class DualTestRuntime:
         self._enter_idle(time.time())
         print('Sequence stopped.')
 
+    def skip_phase(self):
+        seq = self._seq
+        if seq.phase == PHASE_IDLE:
+            print('Sequence is idle; nothing to skip.')
+            return
+        if seq.manual_pause:
+            print('Sequence is paused; resume before skipping.')
+            return
+        now = time.time()
+        if seq.phase == PHASE_FLOW:
+            finishing = TEST_DEFINITIONS[seq.active_test]['label']
+            self._enter_grace(now)
+            print(f'Skipped remaining flow time for {finishing}; entering grace period.')
+        elif seq.phase == PHASE_GRACE:
+            upcoming = _other_test(seq.active_test)
+            self._enter_flow(upcoming, now)
+            print(f'Skipped grace period; {TEST_DEFINITIONS[upcoming]["label"]} now flowing.')
+
     def dump_state(self):
         self._state_manager.save()
         print(f'State saved to {STATE_FILE}')
@@ -882,9 +901,6 @@ class DualTestRuntime:
         self._psu.shutdown('application exit')
         for contactor in self._contactors.values():
             contactor.close()
-        self._reader.close()
-        for writer in self._writers.values():
-            writer.close()
         for writer in self._tc_writers.values():
             writer.close()
         for reader in self._tc_readers.values():
@@ -892,37 +908,23 @@ class DualTestRuntime:
         self._state_manager.save()
         print('Shutdown complete.')
 
-    def logging_loop(self):
+    def _publish_live_readings(self, timestamp, psu_current, psu_voltage):
+        payload = {
+            'timestamp': timestamp,
+            'psu_current_a': psu_current,
+            'psu_voltage_v': psu_voltage,
+        }
+        with open(LIVE_READINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+
+    def readings_publish_loop(self):
         while not self._stop_event.is_set():
-            phase, active_test = self._seq.phase, self._seq.active_test
-            current_owner = active_test if phase == PHASE_FLOW else None
             timestamp = time.time()
             try:
-                currents = self._reader.read_currents()
                 psu_current, psu_voltage = self._psu.measure()
-                for name in TEST_DEFINITIONS:
-                    is_active = name == active_test
-                    row_phase = phase if is_active else PHASE_IDLE
-                    cycle = self._seq.cycle_counts[name]
-                    self._writers[name].write_currents(currents, SHUNTS, timestamp)
-                    self._writers[f'{name}_csv'].write_currents(
-                        currents, SHUNTS, timestamp,
-                        cycle=cycle,
-                        phase=row_phase,
-                        current_owner=current_owner,
-                        psu_current=psu_current,
-                        psu_voltage=psu_voltage,
-                    )
-                    self._writers[f'{name}_xlsx'].write_currents(
-                        currents, SHUNTS, timestamp,
-                        cycle=cycle,
-                        phase=row_phase,
-                        current_owner=current_owner,
-                        psu_current=psu_current,
-                        psu_voltage=psu_voltage,
-                    )
+                self._publish_live_readings(timestamp, psu_current, psu_voltage)
             except Exception as exc:
-                print(f'  [logger error] {type(exc).__name__}: {exc}')
+                print(f'  [readings publish error] {type(exc).__name__}: {exc}')
             if (timestamp - self._last_tc_log) >= TC_INTERVAL:
                 self._maybe_log_tcs(timestamp)
                 self._last_tc_log = timestamp
@@ -960,6 +962,8 @@ class DualTestRuntime:
             self.resume_sequence()
         elif cmd == 'stop':
             self.stop_sequence()
+        elif cmd == 'skip':
+            self.skip_phase()
         elif cmd == 'dump':
             self.dump_state()
         elif cmd in ('quit', 'exit', 'q'):
@@ -975,14 +979,15 @@ class DualTestRuntime:
         print('  pause                - pause the sequence, current off')
         print('  resume               - resume a paused sequence')
         print('  stop                 - stop the sequence and reset to idle')
+        print('  skip                 - end the current phase early and advance')
         print('  dump                 - save current state to disk')
         print('  quit / exit / q      - cleanly shutdown and exit')
 
     def run(self):
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-        logger_thread = threading.Thread(target=self.logging_loop, daemon=True)
-        logger_thread.start()
+        readings_thread = threading.Thread(target=self.readings_publish_loop, daemon=True)
+        readings_thread.start()
         try:
             while not self._stop_event.is_set():
                 self._update_states()

@@ -1,1 +1,9 @@
 .env
+__pycache__/
+
+# generated at runtime by dual_test_runtime.py / logger.py
+dual_test_history.log
+dual_test_log_*.csv
+dual_test_log.xlsx
+dual_test_state.json
+dual_test_live_readings.json
